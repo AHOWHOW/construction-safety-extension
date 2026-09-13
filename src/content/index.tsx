@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import ReactDOM from 'react-dom/client';
 import { Sidebar } from './Sidebar';
 import { Overlay } from './Overlay';
@@ -31,10 +31,18 @@ function ContentApp() {
   const [overlayVisible, setOverlayVisible] = useState(false);
   const [overlayPos, setOverlayPos] = useState({ top: 0, left: 0 });
   const [targetImage, setTargetImage] = useState<HTMLImageElement | null>(null);
+  // 滑鼠追蹤的 effect 需要讀「目前鎖定哪張圖」，但不能因此把 targetImage 放進
+  // 依賴陣列（否則每換一張圖就重新註冊一次監聽器）。用 ref 讀最新值。
+  const targetImageRef = useRef<HTMLImageElement | null>(null);
 
+  // 來自 popup／background 的訊息監聽
+  //
+  // 2026-09-13 修正：這段原本跟滑鼠偵測合在同一個 useEffect、依賴陣列是
+  // [targetImage]，但 cleanup 只移除了滑鼠監聽器、沒有移除 chrome 訊息監聽器。
+  // 結果每 hover 到一張新圖片就會多註冊一個訊息監聽器，逛久了會累積數十個，
+  // ANALYSIS_NARRATIVE_READY 會被重複處理。拆成獨立 effect 並補上 removeListener。
   useEffect(() => {
-    // Listen for messages from popup
-    chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    const handleMessage = (msg: any, _sender: any, sendResponse: (r?: any) => void) => {
       if (msg.type === "ANALYZE_CURRENT") {
         alert("Analyzing all images feature coming soon!");
       }
@@ -55,52 +63,84 @@ function ContentApp() {
           prev ? { ...prev, narrativePending: false, narrativeError: msg.error } : prev
         );
       }
-    });
+    };
 
-    // Image Hover Detection
-    const handleMouseOver = (e: MouseEvent) => {
-      const target = e.target as HTMLElement;
-      if (target.tagName === 'IMG') {
-        const img = target as HTMLImageElement;
-        // Check if image is large enough to matter
-        if (img.width > 100 && img.height > 100) {
-          const rect = img.getBoundingClientRect();
-          // Position overlay at top-right of image, but relative to viewport
-          // accounting for scroll
-          setOverlayPos({
-            top: rect.top + window.scrollY + 10,
-            left: rect.left + window.scrollX + 10
-          });
-          setTargetImage(img);
-          setOverlayVisible(true);
+    chrome.runtime.onMessage.addListener(handleMessage);
+    return () => chrome.runtime.onMessage.removeListener(handleMessage);
+  }, []);
+
+  // 圖片 hover 偵測
+  //
+  // 2026-09-13 修正（使用者回報 Google 相簿的照片無法啟動分析）：
+  // 原本的寫法是 `if (e.target.tagName === 'IMG')`，這要求圖片本身就是滑鼠事件
+  // 的目標元素。但 Google 相簿、FB、IG 這類網站會在照片「上面」疊一層透明的 div
+  // 來接手勢操作（滑動換張、點擊隱藏介面、縮放），滑鼠事件打到的是那層 div，
+  // e.target 永遠不會是 <img>，所以 Analyze 按鈕完全不會出現。
+  // （實測 Google 相簿 hover 到的是 DIV.YW656b。）
+  //
+  // 改用 document.elementsFromPoint()：它回傳該座標上「由上到下堆疊的所有元素」，
+  // 不管上面蓋了幾層，只要底下有 <img> 就找得到。對沒有覆蓋層的一般網頁行為完全
+  // 不變（stack[0] 本來就是 <img>），只是多涵蓋了有覆蓋層的情況，屬於純擴充。
+  useEffect(() => {
+    let rafPending = false;
+    let lastX = 0;
+    let lastY = 0;
+
+    const findImageAt = (x: number, y: number): HTMLImageElement | null => {
+      const stack = document.elementsFromPoint(x, y);
+
+      // 滑鼠移到我們自己的 Analyze 按鈕上時維持現狀，不要把 overlay 收掉，
+      // 否則按鈕會在「滑鼠正要移過去」的瞬間消失、永遠點不到。按鈕在 shadow DOM
+      // 裡，elementsFromPoint 不會穿透 shadow 邊界，回傳的是 shadow host（rootHost）。
+      if (stack.includes(rootHost)) return targetImageRef.current;
+
+      for (const el of stack) {
+        if (el.tagName !== 'IMG') continue;
+        const img = el as HTMLImageElement;
+        // 太小的圖（icon、頭像、tracking pixel）不值得分析。
+        // 用 getBoundingClientRect 而非 img.width——後者在某些 CSS 佈局下會回傳 0。
+        const rect = img.getBoundingClientRect();
+        if (rect.width > 100 && rect.height > 100) return img;
+      }
+      return null;
+    };
+
+    const handleMouseMove = (e: MouseEvent) => {
+      lastX = e.clientX;
+      lastY = e.clientY;
+      // mousemove 觸發非常頻繁（每秒可達上百次），用 rAF 節流成一個影格最多算一次，
+      // 避免 elementsFromPoint 這種會觸發 layout 的呼叫拖慢頁面捲動。
+      if (rafPending) return;
+      rafPending = true;
+      requestAnimationFrame(() => {
+        rafPending = false;
+        const img = findImageAt(lastX, lastY);
+
+        if (!img) {
+          setOverlayVisible(false);
+          return;
         }
-      } else if (target === rootHost || rootHost.contains(target)) {
-        // Don't hide if hovering our own UI
-      } else {
-        // Maybe hide with delay? For now simple implementation.
-        // setOverlayVisible(false); 
-        // Logic needs to be smarter to handle mouse out of image vs into button
-      }
+        // 還在同一張圖上就只確保按鈕是顯示的，不要重設 state——否則滑鼠每動一下
+        // 都會觸發一次 React re-render。
+        if (img === targetImageRef.current) {
+          setOverlayVisible(true);
+          return;
+        }
+
+        const rect = img.getBoundingClientRect();
+        setOverlayPos({
+          top: rect.top + window.scrollY + 10,
+          left: rect.left + window.scrollX + 10
+        });
+        targetImageRef.current = img;
+        setTargetImage(img);
+        setOverlayVisible(true);
+      });
     };
 
-    // Better hover handling
-    let hoverTimeout: any;
-    const handleMouseOut = (e: MouseEvent) => {
-      const related = e.relatedTarget as HTMLElement;
-      if (related && (related === rootHost || rootHost.contains(related))) return;
-      if (e.target === targetImage) {
-        setOverlayVisible(false);
-      }
-    };
-
-    document.addEventListener('mouseover', handleMouseOver);
-    // document.addEventListener('mouseout', handleMouseOut); // Simplistic
-
-    return () => {
-      document.removeEventListener('mouseover', handleMouseOver);
-      // document.removeEventListener('mouseout', handleMouseOut);
-    };
-  }, [targetImage]);
+    document.addEventListener('mousemove', handleMouseMove, { passive: true });
+    return () => document.removeEventListener('mousemove', handleMouseMove);
+  }, []);
 
   const handleAnalyze = async () => {
     if (!targetImage) return;
