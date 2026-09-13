@@ -1,0 +1,32 @@
+# FastAPI Backend for Construction Safety AI
+# Python 3.10+ recommended
+# YOLO11 Only (CLIP Removed)
+
+# Web Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# Image Processing
+Pillow==10.2.0
+numpy==1.26.3
+
+# HTTP Requests
+requests==2.31.0
+
+# YOLO11 (Ultralytics)
+ultralytics>=8.3.0  # YOLO11 support (需要 8.3.0+)
+
+# PyTorch (Ultralytics 依賴)
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Hugging Face Hub (用於下載模型)
+huggingface-hub>=0.20.0
+
+# PDF Generation
+reportlab>=4.0.0
+
+# 其他工具
+pydantic==2.5.3
+python-dotenv==1.0.0
